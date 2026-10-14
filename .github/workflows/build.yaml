@@ -1,0 +1,95 @@
+# Publish a release on GitHub (Releases -> Draft a new release) and this builds every
+# platform and attaches the files to it. "Run workflow" on the Actions tab builds
+# without releasing; the files are on the run's page.
+name: Build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            onefile: --onefile
+            icon: --icon assets/icon.ico
+            asset: SecureBackup-windows-x64.exe
+          - os: macos-latest # Apple Silicon
+            onefile: ""
+            icon: --icon assets/icon.icns
+            asset: SecureBackup-macos-arm64.zip
+          - os: ubuntu-22.04 # older glibc, so the binary runs on more distros
+            onefile: --onefile
+            icon: "" # Linux binaries carry no icon; the window sets its own
+            asset: SecureBackup-linux-x64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install Qt's X11 libraries (bundled into the Linux binary)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-keysyms1 libxcb-shape0 libxcb-randr0 libxcb-render-util0 libxcb-image0 \
+            libxcb-xinerama0 libxcb-xkb1
+
+      - run: pip install -r requirements.txt pyinstaller==6.22.3
+
+      - run: python test_secure_backup.py
+
+      - run: pyinstaller --noconfirm --windowed ${{ matrix.onefile }} ${{ matrix.icon }} --name SecureBackup app.py
+
+      - name: Smoke test the bundled app
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          case "${{ runner.os }}" in
+            Windows) dist/SecureBackup.exe --smoke-test ;;
+            macOS)   dist/SecureBackup.app/Contents/MacOS/SecureBackup --smoke-test ;;
+            Linux)   dist/SecureBackup --smoke-test ;;
+          esac
+
+      - name: Package
+        run: |
+          case "${{ runner.os }}" in
+            Windows) mv dist/SecureBackup.exe "${{ matrix.asset }}" ;;
+            macOS)   ditto -c -k --keepParent dist/SecureBackup.app "${{ matrix.asset }}" ;;
+            Linux)   tar -czf "${{ matrix.asset }}" -C dist SecureBackup ;;
+          esac
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
