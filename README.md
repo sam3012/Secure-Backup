@@ -23,9 +23,12 @@ The apps aren't signed with a paid certificate, so the first launch shows a warn
 
 ## Using it
 
-1. Drop folders or files onto the window (or use **Add folder… / Add files…**).
-2. Type your passphrase (twice when encrypting).
-3. Press **Start**.
+1. Choose **Encrypt** or **Decrypt**. Each run does only that one thing.
+2. Drop folders or files onto the window (or use **Choose a folder / choose files**), then press **Continue**.
+3. Passphrase:
+   - **Encrypting:** use the suggested passphrase (six random words) or type your own twice. Save it, tick
+     **I've saved this passphrase somewhere safe**, and press **Encrypt**.
+   - **Decrypting:** type the passphrase the files were encrypted with, and press **Decrypt**.
 
 | You drop | You get, in the same place |
 |---|---|
@@ -34,7 +37,10 @@ The apps aren't signed with a paid certificate, so the first launch shows a warn
 | `photo.jpg` | `photo.jpg.enc` |
 | `photo.jpg.enc` | `photo.jpg` |
 
-- It decides whether to encrypt or decrypt for you. A folder that holds only `.enc` files is decrypted; anything else is encrypted.
+- Encrypt turns away anything that's already encrypted, and Decrypt turns away anything with no `.enc` files in it.
+- Adding to an `_encrypted` folder that already exists asks for the passphrase you used last time instead of
+  suggesting a new one, and checks it against a file already in there before it encrypts anything. One folder
+  never ends up with two passphrases. The command line does the same check.
 - If the output already exists, it asks you what to do:
   - **only new or changed files**: handy after you add photos to a folder.
   - **skip files already there**: when decrypting.
@@ -45,6 +51,12 @@ The apps aren't signed with a paid certificate, so the first launch shows a warn
 
 > **There is no passphrase recovery.** Lose the passphrase and the files are gone. That's the point.
 > Keep it in a password manager.
+
+The suggested passphrase is six words picked with Python's `secrets` module from
+[EFF's large wordlist](https://www.eff.org/dice) (7,776 words, in `wordlist.py`), about 77 bits. The list being
+public doesn't weaken it: an attacker still has to try 7,776⁶ combinations, each costing a full scrypt run.
+The word list is by the Electronic Frontier Foundation, licensed under
+[CC BY 3.0 US](https://creativecommons.org/licenses/by/3.0/us/).
 
 ## Command line
 
@@ -65,7 +77,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test_secure_backup.py  # self-check
 ```
 
-The icons in `assets/` are rendered from `app_icon()` in `app.py`.
+The icons in `assets/` are rendered from `app_icon()` in `app.py`. The interface font is
+[IBM Plex Sans](https://github.com/IBM/plex), bundled in `assets/fonts/` under the SIL Open Font License
+(`assets/fonts/LICENSE.txt`).
 
 **Releasing:** on GitHub, go to **Releases** → **Draft a new release**, type a new tag such as `v1.0.0`,
 and press **Publish release**. GitHub Actions then builds Windows, macOS, and Linux and attaches the
