@@ -353,8 +353,10 @@ def footer(back, primary):
 class ChoiceButton(QPushButton):
     """A big button on the start page: an icon, the action, and what it does."""
 
-    def __init__(self, mode, text, on_choose):
-        super().__init__(objectName="choice", clicked=lambda _=False: on_choose(mode))
+    chosen = Signal(str)  # its mode
+
+    def __init__(self, mode, text):
+        super().__init__(objectName="choice", clicked=self.choose)
         self.mode = mode
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName(VERB[mode])
@@ -375,6 +377,9 @@ class ChoiceButton(QPushButton):
         layout.addLayout(words, 1)
         for label in self.findChildren(QLabel):
             label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)  # clicks go to the button
+
+    def choose(self):
+        self.chosen.emit(self.mode)
 
     def set_theme(self, t):
         encrypt = self.mode == "encrypt"
@@ -584,6 +589,8 @@ class Worker(QThread):
 
 ROW_HEIGHT = 64
 STEP = {"add": 0, "passphrase": 1, "running": 2, "result": 3}  # position in the step bar
+# Every signal connects to a method, never a lambda: with PySide 6.12 on Linux, lambda slots
+# can crash the app when the window is torn down (the CI smoke test caught it).
 
 
 class Window(QWidget):
@@ -618,9 +625,11 @@ class Window(QWidget):
         header.addWidget(self.logo)
         header.addLayout(titles, 1)
         self.choices = [
-            ChoiceButton("encrypt", "Make copies that only your passphrase can open.", self.choose),
-            ChoiceButton("decrypt", "Turn encrypted copies back into normal files.", self.choose),
+            ChoiceButton("encrypt", "Make copies that only your passphrase can open."),
+            ChoiceButton("decrypt", "Turn encrypted copies back into normal files."),
         ]
+        for choice in self.choices:
+            choice.chosen.connect(self.choose)
         self.start_band = Band(112)
         promise = QHBoxLayout(self.start_band.box)
         promise.setContentsMargins(20, 0, 20, 0)
@@ -686,7 +695,7 @@ class Window(QWidget):
         tools.addWidget(self.copy_btn)
         tools.addWidget(self.another_btn)
         tools.addStretch()
-        tools.addWidget(link("Type my own instead", lambda _=False: self.set_own(True)))
+        tools.addWidget(link("Type my own instead", self.type_own))
         box = QFrame(objectName="suggestBox")
         box_layout = QVBoxLayout(box)
         box_layout.setContentsMargins(18, 14, 18, 16)
@@ -704,7 +713,7 @@ class Window(QWidget):
         self.passphrase = QLineEdit(placeholderText="Passphrase", echoMode=QLineEdit.EchoMode.Password)
         self.confirm = QLineEdit(placeholderText="Type it again", echoMode=QLineEdit.EchoMode.Password)
         self.show_pass = QCheckBox("Show passphrase", toggled=self.set_revealed)
-        self.use_suggestion = link("Use a suggested one", lambda _=False: self.set_own(False))
+        self.use_suggestion = link("Use a suggested one", self.use_suggested)
         for field in (self.passphrase, self.confirm):
             field.returnPressed.connect(self.start)
             field.textChanged.connect(self.on_typing)
@@ -734,7 +743,7 @@ class Window(QWidget):
         passphrase.addWidget(self.saved)
         passphrase.addWidget(self.hint)
         passphrase.addStretch()
-        passphrase.addLayout(footer(lambda _=False: self.go("add"), self.start_btn))
+        passphrase.addLayout(footer(self.back_to_add, self.start_btn))
 
         # Step 3, running: one bar, what's happening, and a way out
         self.run_title = QLabel(objectName="headline")
@@ -909,7 +918,8 @@ class Window(QWidget):
         text.setSpacing(2)
         text.addWidget(ElidedLabel(path.name, "rowName"))
         text.addWidget(ElidedLabel(summary, "meta", Qt.TextElideMode.ElideRight))
-        remove = QToolButton(objectName="remove", clicked=lambda _=False, p=path: self.remove(p))
+        remove = QToolButton(objectName="remove", clicked=self.remove_clicked)
+        remove.setProperty("path", str(path))  # which row it removes; see remove_clicked
         remove.setIcon(QIcon(icon_pixmap("x", self.t["ink2"], 16)))
         remove.setFixedSize(28, 28)
         remove.setToolTip("Remove from list")
@@ -989,6 +999,15 @@ class Window(QWidget):
         self.go("passphrase")
         (self.saved if self.suggesting() else self.passphrase).setFocus()
 
+    def back_to_add(self):
+        self.go("add")
+
+    def type_own(self):
+        self.set_own(True)
+
+    def use_suggested(self):
+        self.set_own(False)
+
     def set_own(self, own):
         self.own, self.message = own, None
         self.forget_passphrase()
@@ -1006,7 +1025,10 @@ class Window(QWidget):
         # Never cleared on a timer: the clipboard may be the only copy until it's pasted somewhere safe.
         QApplication.clipboard().setText(self.suggestion)
         self.copy_btn.setText("Copied")
-        QTimer.singleShot(1500, lambda: self.copy_btn.setText("Copy"))
+        QTimer.singleShot(1500, self.reset_copy_label)
+
+    def reset_copy_label(self):
+        self.copy_btn.setText("Copy")
 
     def reset(self):
         """Back to the start page, keeping nothing: the list, typed passphrases, the suggestion."""
@@ -1064,6 +1086,9 @@ class Window(QWidget):
                 self.items.append((path, target, summary, len(pairs)))
         self.message = (" ".join(refused), "error") if refused else None
         self.refresh()
+
+    def remove_clicked(self):
+        self.remove(Path(self.sender().property("path")))
 
     def remove(self, path):
         self.items = [item for item in self.items if item[0] != path]
