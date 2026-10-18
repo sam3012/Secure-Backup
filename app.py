@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Secure Backup — drop folders or files in, type a passphrase, and get
-encrypted (or decrypted) copies next to the originals. The crypto lives in
-secure_backup.py; this file is only the window.
+"""Secure Backup — choose Encrypt or Decrypt, add folders or files, give a
+passphrase, and get copies next to the originals. One action per run, one
+step at a time. The crypto lives in secure_backup.py; this file is only the
+window.
 
-The look borrows from security envelopes: the drop zone is printed with the
-interlaced waves that keep an envelope's contents unreadable, with a clear
-"address window" for the text."""
+The look borrows from security envelopes: the drop zone and the step bar are
+printed with the interlaced waves that keep an envelope's contents unreadable,
+with a clear "address window" for the text."""
 
 import math
 import subprocess
@@ -15,15 +16,21 @@ from pathlib import Path
 from string import Template
 
 from PySide6.QtCore import QByteArray, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QLinearGradient, QPainter, QPainterPath, QPalette, QPen,
+    QPixmap,
+)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QToolButton,
+    QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QStackedWidget, QToolButton,
     QVBoxLayout, QWidget,
 )
 
-from secure_backup import decrypt_file, default_target, detect_mode, encrypt_file, needs_work, numbered, plan
+from secure_backup import (
+    ENCRYPTED_SUFFIX, decrypt_file, default_target, detect_mode, encrypt_file, needs_work, numbered, plan,
+    same_passphrase, suggest_passphrase,
+)
 
 # --- look ----------------------------------------------------------------
 
@@ -42,6 +49,17 @@ DARK = dict(
     pattern="0.17",
 )
 
+FONT = "IBM Plex Sans"  # bundled in assets/fonts (SIL Open Font License), so every OS looks the same
+
+
+def use_bundled_font(app):
+    """Load assets/fonts and make FONT the app's font. Without the files Qt quietly
+    falls back to the system font."""
+    fonts = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "assets" / "fonts"  # PyInstaller unpacks here
+    for path in fonts.glob("*.ttf"):
+        QFontDatabase.addApplicationFont(str(path))
+    app.setFont(QFont(FONT))
+
 QSS = Template("""
 * { font-size: 13px; }
 QWidget#root, QMessageBox { background: $paper; }
@@ -49,6 +67,7 @@ QLabel { color: $ink; }
 QLabel:disabled { color: $ink3; }
 QLabel#title { font-size: 22px; font-weight: 600; }
 QLabel#subtitle { color: $ink2; }
+QLabel#pageTitle { font-size: 24px; font-weight: 700; }
 QLabel#section { color: $ink2; font-weight: 600; }
 QLabel#dropTitle { font-size: 16px; font-weight: 600; }
 QLabel#dropHint, QLabel#meta { color: $ink2; font-size: 12px; }
@@ -60,15 +79,18 @@ QLabel#rowName { font-size: 14px; font-weight: 600; }
 QLabel#tile { border-radius: 9px; }
 QLabel#tile[mode="encrypt"] { background: $accent_soft; }
 QLabel#tile[mode="decrypt"] { background: $open_soft; }
-QLabel#pill { border-radius: 8px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
-QLabel#pill[mode="encrypt"] { background: $accent_soft; color: $accent_text; }
-QLabel#pill[mode="decrypt"] { background: $open_soft; color: $open; }
 QLabel#resultTile { border-radius: 22px; }
 QLabel#resultTile[tone="ok"] { background: $open_soft; }
 QLabel#resultTile[tone="warn"] { background: $danger_soft; }
 QLabel#headline { font-size: 17px; font-weight: 600; }
 QLabel#percent { font-size: 17px; font-weight: 600; color: $accent_text; }
 QLabel#body { color: $ink2; }
+QLabel#choiceTitle { font-size: 17px; font-weight: 600; }
+QLabel#suggested { font-size: 20px; font-weight: 600; }
+QLabel#stepName { color: $ink2; font-weight: 600; }
+QLabel#stepName[state="current"] { color: $ink; }
+QFrame#stepLine { background: $line; }
+QFrame#suggestBox { background: $surface; border: 1px solid $line; border-radius: 12px; }
 
 QPushButton {
     background: $surface; color: $ink; border: 1px solid $line; border-radius: 8px;
@@ -89,6 +111,9 @@ QPushButton[large="true"] { min-height: 40px; }
 QPushButton#link { background: transparent; border: none; color: $accent_text; padding: 0; min-height: 0; }
 QPushButton#link:hover, QPushButton#link:focus { text-decoration: underline; }
 QPushButton#link:disabled { color: $ink3; }
+QPushButton#choice { background: $surface; border: 1px solid $line; border-radius: 12px; padding: 0; min-height: 88px; }
+QPushButton#choice:hover { border-color: $accent; }
+QPushButton#choice:focus { border: 2px solid $accent; }
 QToolButton#remove { background: transparent; border: none; border-radius: 14px; }
 QToolButton#remove:hover { background: $track; }
 
@@ -125,6 +150,10 @@ ICONS = {  # 24×24 strokes, colored at render time
     "x": '<path d="M7 7l10 10M17 7 7 17"/>',
     "check": '<path d="M6 12.5l4 4L18 8"/>',
     "alert": '<path d="M12 6.5v7M12 17v.5"/>',
+    "lock": '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+    "unlock": '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 7.6-1.8"/>',
+    "copy": '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+    "refresh": '<path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/>',
 }
 
 
@@ -138,6 +167,35 @@ def icon_pixmap(name, color, size):
     QSvgRenderer(QByteArray(svg.encode())).render(painter)
     painter.end()
     pm.setDevicePixelRatio(dpr)
+    return pm
+
+
+def step_badge(n, state, t):
+    """The circle in front of a step's name: a check once it's done, else its number."""
+    size, dpr = 22, 3
+    pm = QPixmap(size * dpr, size * dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    pm.setDevicePixelRatio(dpr)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    circle = QRectF(0.5, 0.5, size - 1, size - 1)
+    if state == "done":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(t["open_soft"]))
+        p.drawEllipse(circle)
+        p.drawPixmap(QPointF(4, 4), icon_pixmap("check", t["open"], 14))
+    else:
+        current = state == "current"
+        p.setPen(Qt.PenStyle.NoPen if current else QPen(QColor(t["ink3"]), 1))
+        p.setBrush(QColor(t["accent"]) if current else Qt.BrushStyle.NoBrush)
+        p.drawEllipse(circle)
+        font = QApplication.font()
+        font.setPixelSize(12)
+        font.setBold(current)
+        p.setFont(font)
+        p.setPen(QColor(t["on_accent" if current else "ink2"]))
+        p.drawText(circle, Qt.AlignmentFlag.AlignCenter, str(n))
+    p.end()
     return pm
 
 
@@ -246,6 +304,9 @@ def reveal(path):
 
 # --- widgets -------------------------------------------------------------
 
+VERB = {"encrypt": "Encrypt", "decrypt": "Decrypt"}
+
+
 class ElidedLabel(QLabel):
     """A label that shortens long names with … instead of widening the window."""
 
@@ -269,6 +330,120 @@ def link(text, slot):
     return button
 
 
+def stack(*widgets):
+    """Widgets one under the other, close together: a title and its text."""
+    layout = QVBoxLayout()
+    layout.setSpacing(4)
+    for widget in widgets:
+        layout.addWidget(widget)
+    return layout
+
+
+def footer(back, primary):
+    """Back on the left, the step's main button on the right."""
+    back_btn = QPushButton("Back", clicked=back)
+    back_btn.setProperty("large", True)
+    row = QHBoxLayout()
+    row.addWidget(back_btn)
+    row.addStretch()
+    row.addWidget(primary)
+    return row
+
+
+class ChoiceButton(QPushButton):
+    """A big button on the start page: an icon, the action, and what it does."""
+
+    def __init__(self, mode, text, on_choose):
+        super().__init__(objectName="choice", clicked=lambda _=False: on_choose(mode))
+        self.mode = mode
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName(VERB[mode])
+        self.setAccessibleDescription(text)
+        self.tile = QLabel(objectName="tile", alignment=Qt.AlignmentFlag.AlignCenter)
+        self.tile.setFixedSize(44, 44)
+        self.tile.setProperty("mode", mode)
+        words = QVBoxLayout()
+        words.setSpacing(2)
+        words.addStretch()
+        words.addWidget(QLabel(VERB[mode], objectName="choiceTitle"))
+        words.addWidget(QLabel(text, objectName="body"))
+        words.addStretch()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 0, 18, 0)
+        layout.setSpacing(16)
+        layout.addWidget(self.tile)
+        layout.addLayout(words, 1)
+        for label in self.findChildren(QLabel):
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)  # clicks go to the button
+
+    def set_theme(self, t):
+        encrypt = self.mode == "encrypt"
+        self.tile.setPixmap(icon_pixmap("lock" if encrypt else "unlock", t["accent_text" if encrypt else "open"], 22))
+
+
+class Band(QWidget):
+    """A strip printed with envelope waves, with `box` sitting in a clear window."""
+
+    def __init__(self, height):
+        super().__init__()
+        self.theme = LIGHT
+        self.setFixedHeight(height)
+        self.box = QWidget(self)
+        self.box.setFixedHeight(48)
+        outer = QHBoxLayout(self)
+        outer.addStretch()
+        outer.addWidget(self.box)
+        outer.addStretch()
+
+    def set_theme(self, theme):
+        self.theme = theme
+        self.update()
+
+    def paintEvent(self, _):
+        t = self.theme
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        band = QRectF(self.rect())
+        p.fillRect(band, QColor(t["accent_soft"]))
+        ink = QColor(t["accent_text"])
+        ink.setAlphaF(float(t["pattern"]))
+        draw_guilloche(p, band, ink, spacing=13, amplitude=4, wavelength=34)
+        window = QPainterPath()
+        window.addRoundedRect(QRectF(self.box.geometry()), 10, 10)
+        p.fillPath(window, QColor(t["surface"]))
+
+
+class StepBar(Band):
+    """The band across the top of every step, with the steps in its window."""
+
+    def __init__(self):
+        super().__init__(88)
+        row = QHBoxLayout(self.box)
+        row.setContentsMargins(18, 0, 18, 0)
+        row.setSpacing(10)
+        self.badges, self.names = [], []
+        for i in range(3):
+            if i:
+                line = QFrame(objectName="stepLine")
+                line.setFixedSize(24, 1)
+                row.addWidget(line)
+            badge, name = QLabel(), QLabel(objectName="stepName")
+            badge.setFixedSize(22, 22)
+            row.addWidget(badge)
+            row.addWidget(name)
+            self.badges.append(badge)
+            self.names.append(name)
+
+    def set_step(self, current, action, theme):
+        """Steps before `current` are done; `current` 3 means all of them are."""
+        for i, (badge, name) in enumerate(zip(self.badges, self.names)):
+            state = "done" if i < current else "current" if i == current else "todo"
+            name.setText(("Add files", "Passphrase", action)[i])
+            set_prop(name, "state", state)
+            badge.setPixmap(step_badge(i + 1, state, theme))
+        self.set_theme(theme)
+
+
 class DropZone(QFrame):
     def __init__(self, on_folder, on_files):
         super().__init__()
@@ -276,8 +451,7 @@ class DropZone(QFrame):
         self.badge = QLabel(objectName="badge", alignment=Qt.AlignmentFlag.AlignCenter)
         self.badge.setFixedSize(48, 48)
         self.title = QLabel(objectName="dropTitle", alignment=Qt.AlignmentFlag.AlignCenter)
-        self.hint = QLabel("Folders you've already encrypted are decrypted instead.",
-                           objectName="dropHint", alignment=Qt.AlignmentFlag.AlignCenter)
+        self.hint = QLabel(objectName="dropHint", alignment=Qt.AlignmentFlag.AlignCenter)
         links = QHBoxLayout()
         links.setSpacing(6)
         links.addStretch()
@@ -309,6 +483,9 @@ class DropZone(QFrame):
         self.theme = theme
         self.badge.setPixmap(icon_pixmap("drop", theme["accent_text"], 24))
         self.update()
+
+    def set_hint(self, text):
+        self.hint.setText(text)
 
     def set_compact(self, compact):
         self.compact = compact
@@ -391,8 +568,8 @@ class Worker(QThread):
                 result["message"] = (f"Cancelled{after}. The file in progress was removed.", "")
                 break
             except ValueError as e:
-                # Decrypt jobs run first, smallest first, so if the very first one
-                # fails it's the passphrase — stop before chewing through big videos.
+                # Jobs run smallest first, so if the very first decrypt fails it's
+                # the passphrase — stop before chewing through big videos.
                 if mode == "decrypt" and not result["decrypt"]:
                     result["message"] = (f"Wrong passphrase, or “{src.name}” is damaged. Nothing was changed.", "error")
                     break
@@ -406,6 +583,7 @@ class Worker(QThread):
 # --- window --------------------------------------------------------------
 
 ROW_HEIGHT = 64
+STEP = {"add": 0, "passphrase": 1, "running": 2, "result": 3}  # position in the step bar
 
 
 class Window(QWidget):
@@ -417,13 +595,17 @@ class Window(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)  # start with nothing focused; Tab still works
         self.resize(600, 720)
         self.setMinimumSize(520, 620)
-        self.items = []  # (path, mode, target, summary)
+        self.page = "start"  # start | add | passphrase | running | result
+        self.mode = None  # "encrypt" or "decrypt": chosen first, and the only thing this run does
+        self.items = []  # (path, target, summary, file count)
         self.worker = None
-        self.page = "ready"  # ready | running | result
-        self.message = None  # (text, tone) shown under the passphrase
+        self.message = None  # (text, tone) shown on the current step
+        self.suggestion = ""  # six words joined by single spaces: exactly what gets typed later
+        self.own = False  # encrypting with a typed passphrase instead of the suggested one
+        self.updating = None  # name of an existing _encrypted target: its old passphrase is needed
         self.result_icon = ("check", "open")
 
-        # Header
+        # Start: pick the one thing to do
         self.logo = QLabel()
         title = QLabel("Secure Backup", objectName="title")
         subtitle = QLabel("Encrypt photos and videos before you upload them anywhere.", objectName="subtitle")
@@ -435,10 +617,32 @@ class Window(QWidget):
         header.setSpacing(14)
         header.addWidget(self.logo)
         header.addLayout(titles, 1)
+        self.choices = [
+            ChoiceButton("encrypt", "Make copies that only your passphrase can open.", self.choose),
+            ChoiceButton("decrypt", "Turn encrypted copies back into normal files.", self.choose),
+        ]
+        self.start_band = Band(112)
+        promise = QHBoxLayout(self.start_band.box)
+        promise.setContentsMargins(20, 0, 20, 0)
+        promise.addWidget(QLabel("Your originals are never changed or deleted.", objectName="body"))
+        start_page = QWidget()
+        start_layout = QVBoxLayout(start_page)
+        start_layout.setContentsMargins(0, 0, 0, 0)
+        start = QVBoxLayout()
+        start.setContentsMargins(28, 24, 28, 24)
+        start.setSpacing(12)
+        start.addLayout(header)
+        start.addSpacing(28)
+        for choice in self.choices:
+            start.addWidget(choice)
+        start_layout.addLayout(start)
+        start_layout.addStretch()
+        start_layout.addWidget(self.start_band)
 
+        # Step 1: folders or files, only the kind this action takes
+        self.add_title = QLabel(objectName="pageTitle")
+        self.add_body = QLabel(objectName="body", wordWrap=True)
         self.drop = DropZone(self.pick_folder, self.pick_files)
-
-        # Queue
         self.count = QLabel(objectName="section")
         queue_head = QHBoxLayout()
         queue_head.addWidget(self.count)
@@ -455,29 +659,84 @@ class Window(QWidget):
         queue_layout.addLayout(queue_head)
         queue_layout.addWidget(self.queue)
         queue_layout.addStretch()
+        self.add_hint = QLabel(objectName="hint", wordWrap=True)
+        self.next_btn = QPushButton("Continue", objectName="primary", clicked=self.to_passphrase)
+        add_page = QWidget()
+        self.add_layout = add = QVBoxLayout(add_page)
+        add.setContentsMargins(28, 24, 28, 24)
+        add.setSpacing(16)
+        add.addLayout(stack(self.add_title, self.add_body))
+        add.addWidget(self.drop, 1)
+        add.addWidget(self.add_hint)  # why something wasn't added, right under where it was dropped
+        add.addWidget(self.queue_box, 1)
+        add.addLayout(footer(self.reset, self.next_btn))
 
-        # Ready: passphrase and the main button
+        # Step 2: the passphrase. Encrypting suggests six random words, or you type your own.
+        self.pass_context = QLabel(objectName="body")
+        self.pass_title = QLabel(objectName="pageTitle")
+        self.pass_body = QLabel(objectName="body", wordWrap=True)
+
+        # Three words a line, so it never needs wrapping. Not selectable: a copied line break
+        # wouldn't match what gets typed later, so Copy is the way to copy it.
+        self.suggested = QLabel(objectName="suggested")
+        self.copy_btn = QPushButton("Copy", clicked=self.copy_suggestion)
+        self.another_btn = QPushButton("Another one", clicked=self.new_suggestion)
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        tools.addWidget(self.copy_btn)
+        tools.addWidget(self.another_btn)
+        tools.addStretch()
+        tools.addWidget(link("Type my own instead", lambda _=False: self.set_own(True)))
+        box = QFrame(objectName="suggestBox")
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(18, 14, 18, 16)
+        box_layout.setSpacing(12)
+        box_layout.addWidget(self.suggested)
+        box_layout.addLayout(tools)
+        self.suggest_box = QWidget()
+        suggest = QVBoxLayout(self.suggest_box)
+        suggest.setContentsMargins(0, 0, 0, 0)
+        suggest.setSpacing(8)
+        suggest.addWidget(QLabel("Suggested passphrase", objectName="section"))
+        suggest.addWidget(box)
+        suggest.addWidget(QLabel("Six random words is strong enough for this.", objectName="hint"))
+
         self.passphrase = QLineEdit(placeholderText="Passphrase", echoMode=QLineEdit.EchoMode.Password)
         self.confirm = QLineEdit(placeholderText="Type it again", echoMode=QLineEdit.EchoMode.Password)
         self.show_pass = QCheckBox("Show passphrase", toggled=self.set_revealed)
-        self.hint = QLabel(objectName="hint", wordWrap=True)
-        self.start_btn = QPushButton(objectName="primary", clicked=self.start, default=True)
+        self.use_suggestion = link("Use a suggested one", lambda _=False: self.set_own(False))
         for field in (self.passphrase, self.confirm):
             field.returnPressed.connect(self.start)
             field.textChanged.connect(self.on_typing)
-        self.ready_page = QWidget()
-        ready = QVBoxLayout(self.ready_page)
-        ready.setContentsMargins(0, 0, 0, 0)
-        ready.setSpacing(8)
-        ready.addWidget(QLabel("Passphrase", objectName="section"))
-        ready.addWidget(self.passphrase)
-        ready.addWidget(self.confirm)
-        ready.addWidget(self.show_pass)
-        ready.addWidget(self.hint)
-        ready.addSpacing(6)
-        ready.addWidget(self.start_btn)
+        options = QHBoxLayout()
+        options.addWidget(self.show_pass)
+        options.addStretch()
+        options.addWidget(self.use_suggestion)
+        self.own_box = QWidget()
+        own = QVBoxLayout(self.own_box)
+        own.setContentsMargins(0, 0, 0, 0)
+        own.setSpacing(8)
+        own.addWidget(QLabel("Passphrase", objectName="section"))
+        own.addWidget(self.passphrase)
+        own.addWidget(self.confirm)
+        own.addLayout(options)
 
-        # Running: one bar, what's happening, and a way out
+        self.saved = QCheckBox("I've saved this passphrase somewhere safe", toggled=self.update_buttons)
+        self.hint = QLabel(objectName="hint", wordWrap=True)
+        self.start_btn = QPushButton(objectName="primary", clicked=self.start, default=True)
+        pass_page = QWidget()
+        passphrase = QVBoxLayout(pass_page)
+        passphrase.setContentsMargins(28, 24, 28, 24)
+        passphrase.setSpacing(16)
+        passphrase.addLayout(stack(self.pass_context, self.pass_title, self.pass_body))
+        passphrase.addWidget(self.suggest_box)
+        passphrase.addWidget(self.own_box)
+        passphrase.addWidget(self.saved)
+        passphrase.addWidget(self.hint)
+        passphrase.addStretch()
+        passphrase.addLayout(footer(lambda _=False: self.go("add"), self.start_btn))
+
+        # Step 3, running: one bar, what's happening, and a way out
         self.run_title = QLabel(objectName="headline")
         self.percent = QLabel(objectName="percent")
         self.bar = QProgressBar(maximum=1000, textVisible=False)
@@ -501,7 +760,7 @@ class Window(QWidget):
         bottom.addWidget(self.cancel_btn)
         running.addLayout(bottom)
 
-        # Result
+        # Step 3, done: the result
         self.result_tile = QLabel(objectName="resultTile", alignment=Qt.AlignmentFlag.AlignCenter)
         self.result_tile.setFixedSize(44, 44)
         self.headline = QLabel(objectName="headline", wordWrap=True)
@@ -509,7 +768,7 @@ class Window(QWidget):
         self.details = QPlainTextEdit(readOnly=True)
         self.details.setMaximumHeight(110)
         self.reveal_btn = QPushButton(REVEAL_LABEL, objectName="primary", clicked=self.reveal_output)
-        done_btn = QPushButton("Done", clicked=self.dismiss_result)
+        done_btn = QPushButton("Done", clicked=self.reset)
         done_btn.setProperty("large", True)
         self.result_page = QWidget()
         result = QVBoxLayout(self.result_page)
@@ -530,17 +789,29 @@ class Window(QWidget):
         buttons.addWidget(done_btn)
         buttons.addStretch()
         result.addLayout(buttons)
+        run_step = QWidget()
+        last = QVBoxLayout(run_step)
+        last.setContentsMargins(28, 32, 28, 24)
+        last.addWidget(self.run_page)
+        last.addWidget(self.result_page)
+        last.addStretch()
 
+        self.step_bar = StepBar()
+        self.steps = QStackedWidget()
+        for page in (add_page, pass_page, run_step):
+            self.steps.addWidget(page)
+        flow = QWidget()
+        flow_layout = QVBoxLayout(flow)
+        flow_layout.setContentsMargins(0, 0, 0, 0)
+        flow_layout.setSpacing(0)
+        flow_layout.addWidget(self.step_bar)
+        flow_layout.addWidget(self.steps, 1)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(start_page)
+        self.pages.addWidget(flow)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 24)
-        layout.setSpacing(20)
-        layout.addLayout(header)
-        layout.addWidget(self.drop, 1)
-        layout.addWidget(self.queue_box, 1)
-        layout.addWidget(self.ready_page)
-        layout.addWidget(self.run_page)
-        layout.addWidget(self.result_page)
-        layout.addStretch(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.pages)
 
         QApplication.styleHints().colorSchemeChanged.connect(self.apply_theme)
         self.apply_theme()
@@ -557,6 +828,11 @@ class Window(QWidget):
         logo.setDevicePixelRatio(3)
         self.logo.setPixmap(logo)
         self.drop.set_theme(t)
+        self.start_band.set_theme(t)
+        for choice in self.choices:
+            choice.set_theme(t)
+        self.copy_btn.setIcon(QIcon(icon_pixmap("copy", t["ink"], 16)))
+        self.another_btn.setIcon(QIcon(icon_pixmap("refresh", t["ink"], 16)))
         name, color = self.result_icon
         self.result_tile.setPixmap(icon_pixmap(name, t[color], 22))
         self.refresh()
@@ -564,45 +840,75 @@ class Window(QWidget):
     # --- state ----------------------------------------------------------
 
     def refresh(self):
-        has_items = bool(self.items)
-        compact = has_items or self.page == "result"
-        self.drop.set_compact(compact)
-        layout = self.layout()
-        layout.setStretchFactor(self.drop, 0 if compact else 1)
-        layout.setStretch(layout.count() - 1, 1 if compact and not has_items else 0)  # result: space goes below
+        self.pages.setCurrentIndex(0 if self.page == "start" else 1)
+        if self.page == "start":
+            self.setFocus()  # don't leave focus (and its outline) parked on a choice
+            return
+        encrypt = self.mode == "encrypt"
+        self.step_bar.set_step(STEP[self.page], VERB[self.mode], self.t)
+        self.steps.setCurrentIndex(min(STEP[self.page], 2))
 
+        # Step 1
+        has_items = bool(self.items)
+        self.add_title.setText(f"Add what you want to {self.mode}")
+        self.add_body.setText("Copies are saved next to the originals, subfolders included." if encrypt else
+                              "Add _encrypted folders or .enc files. Decrypted copies are saved next to them.")
+        self.drop.set_hint("Photos, videos, documents: any folder or file." if encrypt else
+                           "The _encrypted folders or .enc files this app made.")
+        self.drop.set_compact(has_items)
+        self.add_layout.setStretchFactor(self.drop, 0 if has_items else 1)
         self.queue_box.setVisible(has_items)
         self.count.setText(plural(len(self.items), "item"))
         self.queue.clear()
-        for path, mode, _, summary in self.items:
+        for path, _, summary, _ in self.items:
             item = QListWidgetItem()
             item.setSizeHint(QSize(0, ROW_HEIGHT))
             self.queue.addItem(item)
-            self.queue.setItemWidget(item, self.make_row(path, mode, summary))
+            self.queue.setItemWidget(item, self.make_row(path, summary))
         self.queue.setMaximumHeight(len(self.items) * ROW_HEIGHT + 2)
+        self.next_btn.setEnabled(has_items)
+        text, tone = self.message if self.message and self.page == "add" else ("", "")
+        self.add_hint.setText(text)
+        self.add_hint.setVisible(bool(text))
+        set_prop(self.add_hint, "tone", tone)
 
-        self.ready_page.setVisible(has_items and self.page == "ready")
+        # Step 2
+        new = encrypt and not self.updating  # a brand-new passphrase, so one can be suggested
+        suggesting = self.suggesting()
+        self.pass_context.setText(self.context_text())
+        self.pass_title.setText("Choose a passphrase" if new else "Enter the passphrase")
+        if new:
+            body = "You'll type it every time you open these files. Nobody can reset it, so save it somewhere you won't lose."
+        elif encrypt:
+            body = (f"“{self.updating}” already has encrypted files. Use the same passphrase as last time, "
+                    "or some files won't open with it.")
+        else:
+            body = "Use the passphrase these files were encrypted with."
+        self.pass_body.setText(body)
+        self.suggest_box.setVisible(suggesting)
+        self.own_box.setVisible(not suggesting)
+        self.confirm.setVisible(encrypt)
+        self.use_suggestion.setVisible(new)
+        self.saved.setVisible(new)
+        self.start_btn.setText(self.action_text())
+        self.update_buttons()
+        self.update_hint()
+
+        # Step 3
         self.run_page.setVisible(self.page == "running")
         self.result_page.setVisible(self.page == "result")
-        self.confirm.setVisible(self.encrypting())
-        self.start_btn.setText(self.action_text())
-        self.update_hint()
-        if not has_items and self.page == "ready":
-            self.setFocus()  # don't leave focus (and its underline) parked on a link
 
-    def make_row(self, path, mode, summary):
-        color = self.t["accent_text" if mode == "encrypt" else "open"]
+    def make_row(self, path, summary):
+        color = self.t["accent_text" if self.mode == "encrypt" else "open"]
         tile = QLabel(objectName="tile", alignment=Qt.AlignmentFlag.AlignCenter)
         tile.setFixedSize(36, 36)
-        tile.setProperty("mode", mode)
+        tile.setProperty("mode", self.mode)
         tile.setPixmap(icon_pixmap("folder" if path.is_dir() else "file", color, 18))
         tile.setToolTip(str(path))
         text = QVBoxLayout()
         text.setSpacing(2)
         text.addWidget(ElidedLabel(path.name, "rowName"))
         text.addWidget(ElidedLabel(summary, "meta", Qt.TextElideMode.ElideRight))
-        pill = QLabel(mode.capitalize(), objectName="pill")
-        pill.setProperty("mode", mode)
         remove = QToolButton(objectName="remove", clicked=lambda _=False, p=path: self.remove(p))
         remove.setIcon(QIcon(icon_pixmap("x", self.t["ink2"], 16)))
         remove.setFixedSize(28, 28)
@@ -614,36 +920,39 @@ class Window(QWidget):
         layout.setSpacing(12)
         layout.addWidget(tile)
         layout.addLayout(text, 1)
-        layout.addWidget(pill, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(remove, 0, Qt.AlignmentFlag.AlignVCenter)
         return row
 
-    def encrypting(self):
-        return any(mode == "encrypt" for _, mode, *_ in self.items)
+    def suggesting(self):
+        return self.mode == "encrypt" and not self.updating and not self.own
+
+    def context_text(self):
+        files = sum(n for *_, n in self.items)
+        what = self.items[0][0].name if len(self.items) == 1 else plural(len(self.items), "item")
+        return f"{what}, {plural(files, 'file')}"
 
     def action_text(self):
-        enc = sum(mode == "encrypt" for _, mode, *_ in self.items)
-        dec = len(self.items) - enc
-        if enc and dec:
-            return f"Encrypt {enc} and decrypt {dec}"
         kinds = {path.is_dir() for path, *_ in self.items}
         noun = "folder" if kinds == {True} else "file" if kinds == {False} else "item"
-        return f"{'Encrypt' if enc else 'Decrypt'} {plural(enc or dec, noun)}"
+        return f"{VERB[self.mode]} {plural(len(self.items), noun)}"
+
+    def update_buttons(self, *_):
+        new = self.mode == "encrypt" and not self.updating
+        self.start_btn.setEnabled(not new or self.saved.isChecked())
 
     def update_hint(self):
         p, c = self.passphrase.text(), self.confirm.text()
         mismatch = c and c != p and (len(c) >= len(p) or not p.startswith(c))
-        if self.message:
+        typing = self.mode == "encrypt" and not self.suggesting()
+        text, tone = "", ""
+        if self.message and self.page == "passphrase":
             text, tone = self.message
-        elif self.encrypting() and mismatch:
+        elif typing and mismatch:
             text, tone = "Passphrases don't match.", "error"
-        elif self.encrypting() and c == p and c:
+        elif typing and c == p and c:
             text, tone = "Passphrases match.", "ok"
-        elif self.encrypting():
-            text, tone = "There's no way to recover a forgotten passphrase, so keep it somewhere safe.", ""
-        else:
-            text, tone = "Use the passphrase these files were encrypted with.", ""
         self.hint.setText(text)
+        self.hint.setVisible(bool(text))
         set_prop(self.hint, "tone", tone)
 
     def on_typing(self):
@@ -659,10 +968,60 @@ class Window(QWidget):
         self.confirm.clear()
         self.show_pass.setChecked(False)
 
+    # --- moving between steps ---------------------------------------------
+
+    def go(self, page):
+        self.page, self.message = page, None
+        self.refresh()
+
+    def choose(self, mode):
+        self.mode = mode
+        self.go("add")
+
+    def to_passphrase(self):
+        if not self.items:
+            return
+        encrypt = self.mode == "encrypt"
+        # Adding to an _encrypted folder that's already there needs the passphrase it was made with.
+        self.updating = next((target.name for _, target, *_ in self.items if target.exists()), None) if encrypt else None
+        if encrypt and not self.suggestion:
+            self.new_suggestion()
+        self.go("passphrase")
+        (self.saved if self.suggesting() else self.passphrase).setFocus()
+
+    def set_own(self, own):
+        self.own, self.message = own, None
+        self.forget_passphrase()
+        self.saved.setChecked(False)  # whichever passphrase is shown now hasn't been saved yet
+        self.refresh()
+        (self.passphrase if own else self.saved).setFocus()
+
+    def new_suggestion(self):
+        self.suggestion = suggest_passphrase()
+        words = self.suggestion.split(" ")
+        self.suggested.setText(" ".join(words[:3]) + "\n" + " ".join(words[3:]))
+        self.saved.setChecked(False)
+
+    def copy_suggestion(self):
+        # Never cleared on a timer: the clipboard may be the only copy until it's pasted somewhere safe.
+        QApplication.clipboard().setText(self.suggestion)
+        self.copy_btn.setText("Copied")
+        QTimer.singleShot(1500, lambda: self.copy_btn.setText("Copy"))
+
+    def reset(self):
+        """Back to the start page, keeping nothing: the list, typed passphrases, the suggestion."""
+        self.items.clear()
+        self.mode, self.own, self.updating = None, False, None
+        self.forget_passphrase()
+        self.suggestion = ""
+        self.suggested.clear()
+        self.saved.setChecked(False)
+        self.go("start")
+
     # --- adding and removing -----------------------------------------------
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls() and not self.worker:
+        if event.mimeData().hasUrls() and self.page == "add":
             event.acceptProposedAction()
             self.drop.set_active(True)
 
@@ -682,34 +1041,37 @@ class Window(QWidget):
         self.add_paths(Path(f) for f in files)
 
     def add_paths(self, paths):
-        added = False
+        refused = []
         for path in paths:
             if not path.name or not path.exists() or any(path == item[0] for item in self.items):
                 continue  # drive roots have no "next to it"; skip missing and duplicates
-            mode = detect_mode(path)
-            target = default_target(path, mode)
-            pairs = plan(mode, path, target)
-            size = sum(i.stat().st_size for i, _ in pairs)
-            verb = "Adds to" if target.exists() else "Saves to"
-            summary = f"{plural(len(pairs), 'file')}, {human_size(size)}. {verb} {target.name}"
-            self.items.append((path, mode, target, summary))
-            added = True
-        if added:
-            self.message, self.page = None, "ready"
+            target = default_target(path, self.mode)
+            pairs = plan(self.mode, path, target)
+            if self.mode == "encrypt" and detect_mode(path) == "decrypt":
+                refused.append(f"“{path.name}” is already encrypted. To open it, go back and choose Decrypt.")
+            elif self.mode == "decrypt" and path.is_file() and not path.name.endswith(ENCRYPTED_SUFFIX):
+                refused.append(f"“{path.name}” isn't encrypted: its name doesn't end in .enc. "
+                               "If you renamed it, add .enc back to the end of the name.")
+            elif self.mode == "decrypt" and not pairs:
+                refused.append(f"“{path.name}” has no encrypted files (names ending in .enc). "
+                               "To encrypt it, go back and choose Encrypt.")
+            elif not pairs:
+                refused.append(f"“{path.name}” is empty.")
+            else:
+                size = sum(i.stat().st_size for i, _ in pairs)
+                verb = "Adds to" if target.exists() else "Saves to"
+                summary = f"{plural(len(pairs), 'file')}, {human_size(size)}. {verb} {target.name}"
+                self.items.append((path, target, summary, len(pairs)))
+        self.message = (" ".join(refused), "error") if refused else None
         self.refresh()
-        if added:
-            self.passphrase.setFocus()
 
     def remove(self, path):
         self.items = [item for item in self.items if item[0] != path]
-        if not self.items:
-            self.forget_passphrase()  # an empty list starts over, passphrase included
         self.message = None
         self.refresh()
 
     def clear(self):
         self.items.clear()
-        self.forget_passphrase()
         self.message = None
         self.refresh()
 
@@ -721,32 +1083,38 @@ class Window(QWidget):
         field.setFocus()
 
     def start(self):
-        if not self.items or self.worker or self.page != "ready":
+        if not self.items or self.worker or self.page != "passphrase" or not self.start_btn.isEnabled():
             return
-        passphrase = self.passphrase.text()
-        if not passphrase:
-            return self.fail("Enter a passphrase.", self.passphrase)
-        if self.encrypting() and passphrase != self.confirm.text():
-            return self.fail("Passphrases don't match.", self.confirm)
+        if self.suggesting():
+            passphrase = self.suggestion
+        else:
+            passphrase = self.passphrase.text()
+            if not passphrase:
+                return self.fail("Enter a passphrase.", self.passphrase)
+            if self.mode == "encrypt" and passphrase != self.confirm.text():
+                return self.fail("Passphrases don't match.", self.confirm)
 
         jobs, skipped, targets = [], 0, []
-        for path, mode, target, _ in self.items:
+        for path, target, *_ in self.items:
             if target.exists():
-                target = self.ask_existing(path, mode, target)
+                target = self.ask_existing(path, self.mode, target)
                 if not target:
                     return
             targets.append(target)
-            pairs = plan(mode, path, target)
-            todo = [(mode, i, o, i.stat().st_size) for i, o in pairs if needs_work(mode, i, o)]
+            pairs = plan(self.mode, path, target)
+            if self.mode == "encrypt" and not same_passphrase(pairs, passphrase):
+                field = self.saved if self.suggesting() else self.passphrase
+                return self.fail(f"This passphrase doesn't open the files already in “{target.name}”. "
+                                 "Use the one they were encrypted with, or save a separate copy.", field)
+            todo = [(self.mode, i, o, i.stat().st_size) for i, o in pairs if needs_work(self.mode, i, o)]
             skipped += len(pairs) - len(todo)
             jobs += todo
         if not jobs:
             already = "That file is" if skipped == 1 else f"All {skipped:,} files are"
             self.message = (f"Nothing to do. {already} already done.", "ok")
             return self.update_hint()
-        # Decrypt first, smallest first: a wrong passphrase shows up in a second,
-        # not after a 4 GB video.
-        jobs.sort(key=lambda job: (job[0] != "decrypt", job[3]))
+        # Smallest first: a wrong passphrase shows up in a second, not after a 4 GB video.
+        jobs.sort(key=lambda job: job[3])
 
         self.jobs, self.targets, self.skipped = jobs, targets, skipped
         self.total, self.started = sum(job[3] for job in jobs) or 1, time.monotonic()
@@ -755,7 +1123,6 @@ class Window(QWidget):
         self.worker.done.connect(self.on_done)
         self.page = "running"
         self.cancel_btn.setEnabled(True)
-        self.set_busy(True)
         self.refresh()
         self.on_progress(0.0, 1, jobs[0][1].name, jobs[0][0])
         self.worker.start()
@@ -791,12 +1158,11 @@ class Window(QWidget):
     def on_done(self, result):
         self.worker.wait()
         self.worker = None
-        self.set_busy(False)
-        self.forget_passphrase()
-        if result["message"]:
-            self.message, self.page = result["message"], "ready"
+        self.forget_passphrase()  # typed ones; a suggestion stays until you start over
+        if result["message"]:  # cancelled or wrong passphrase: back to the passphrase step
+            self.page, self.message = "passphrase", result["message"]
             self.refresh()
-            self.passphrase.setFocus()
+            (self.saved if self.suggesting() else self.passphrase).setFocus()
             return
         self.show_result(result)
 
@@ -828,20 +1194,11 @@ class Window(QWidget):
         self.body.setText(body)
         self.details.setPlainText("\n".join(failed))
         self.details.setVisible(bool(failed))
-        self.items.clear()
         self.page = "result"
         self.refresh()
 
     def reveal_output(self):
         reveal(self.targets[0])
-
-    def dismiss_result(self):
-        self.page = "ready"
-        self.refresh()
-
-    def set_busy(self, busy):
-        self.drop.setEnabled(not busy)
-        self.queue_box.setEnabled(not busy)
 
     def cancel(self):
         if self.worker:
@@ -859,6 +1216,7 @@ class Window(QWidget):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")  # same base on every OS; the stylesheet does the rest
+    use_bundled_font(app)
     app.setWindowIcon(QIcon(app_icon(512)))
     window = Window()
     window.show()
