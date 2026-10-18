@@ -39,6 +39,11 @@ def main():
         assert (enc / "trip" / "video.mp4.enc").exists()
         assert not list(enc.rglob("*.part"))
 
+        # Adding to the folder later must use the same passphrase; checking writes nothing.
+        assert sb.same_passphrase(pairs, "pw") and not sb.same_passphrase(pairs, "other")
+        assert sb.same_passphrase(sb.plan("encrypt", photos, root / "new_copy"), "anything")
+        assert not list(enc.rglob("*.part")) and not (root / "new_copy").exists()
+
         # Re-run: nothing to do until a source changes.
         assert not [p for p in pairs if sb.needs_work("encrypt", *p)]
         os.utime(photos / "empty.txt", ns=(2 * 10**18, 2 * 10**18))
@@ -90,6 +95,12 @@ def main():
         assert sb.numbered(target) == root / "legacy (2).jpg"
         assert sb.numbered(legacy) == root / "legacy (2).jpg.enc"
         assert sb.numbered(enc) == root / "Photos_encrypted (2)"
+
+    # Suggested passphrases: six words from the full list, different every time.
+    assert len(set(sb.WORDS)) == 7776
+    words = sb.suggest_passphrase().split(" ")
+    assert len(words) == 6 and all(w in sb.WORDS for w in words), words
+    assert sb.suggest_passphrase() != sb.suggest_passphrase()
 
     print("All checks passed.")
 
