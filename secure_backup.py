@@ -54,6 +54,7 @@ Requires: pip install -r requirements.txt
 import argparse
 import getpass
 import os
+import secrets
 import sys
 from contextlib import contextmanager
 from itertools import takewhile
@@ -62,6 +63,8 @@ from pathlib import Path
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+from wordlist import WORDS
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -79,6 +82,14 @@ def derive_key(passphrase: str, salt: bytes) -> bytes:
     even if someone steals your encrypted files."""
     kdf = Scrypt(salt=salt, length=KEY_SIZE, n=2 ** 15, r=8, p=1)
     return kdf.derive(passphrase.encode("utf-8"))
+
+
+def suggest_passphrase(words: int = 6) -> str:
+    """Random words from EFF's public 7,776-word list: six give about 77 bits,
+    more than a random 64-bit key. Knowing the list doesn't help an attacker;
+    the strength is in `secrets` picking the words, and every guess costs a
+    full scrypt run."""
+    return " ".join(secrets.choice(WORDS) for _ in range(words))
 
 
 @contextmanager
@@ -125,8 +136,9 @@ def encrypt_file(input_path: Path, output_path: Path, passphrase: str, progress=
         fout.write(encryptor.tag)  # 16-byte authentication tag, appended last
 
 
-def decrypt_file(input_path: Path, output_path: Path, passphrase: str, progress=None) -> None:
-    """`progress(nbytes)` is called after each chunk; raise from it to abort."""
+def decrypt_file(input_path: Path, output_path: Path | None, passphrase: str, progress=None) -> None:
+    """`progress(nbytes)` is called after each chunk; raise from it to abort.
+    With `output_path` None it only checks the passphrase and writes nothing."""
     file_size = input_path.stat().st_size
     ciphertext_size = file_size - SALT_SIZE - NONCE_SIZE - TAG_SIZE
     if ciphertext_size < 0:
@@ -143,7 +155,7 @@ def decrypt_file(input_path: Path, output_path: Path, passphrase: str, progress=
 
         decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
 
-        with atomic_output(output_path, input_path) as fout:
+        with atomic_output(output_path, input_path) if output_path else open(os.devnull, "wb") as fout:
             remaining = ciphertext_size
             while remaining > 0:
                 chunk = fin.read(min(CHUNK_SIZE, remaining))
@@ -215,6 +227,19 @@ def needs_work(mode: str, src: Path, out: Path) -> bool:
     return mode == "encrypt" and out.stat().st_mtime_ns < src.stat().st_mtime_ns
 
 
+def same_passphrase(pairs: list[tuple[Path, Path]], passphrase: str) -> bool:
+    """Encrypting into a folder that already has .enc files: whether `passphrase`
+    opens them (tried on the smallest), so one folder never needs two passphrases."""
+    existing = [out for _, out in pairs if out.exists()]
+    if not existing:
+        return True
+    try:
+        decrypt_file(min(existing, key=lambda p: p.stat().st_size), None, passphrase)
+        return True
+    except ValueError:
+        return False
+
+
 def run_with_bar(mode: str, src: Path, out: Path, passphrase: str, label: str) -> None:
     from tqdm.auto import tqdm  # CLI only; the GUI draws its own progress bars
 
@@ -228,6 +253,8 @@ def process(mode: str, source: Path, dest: Path, passphrase: str) -> None:
     if not pairs:
         print(f"No files found under {source}")
         return
+    if mode == "encrypt" and not same_passphrase(pairs, passphrase):
+        sys.exit(f"That passphrase doesn't open the files already in {dest}. Use the one they were encrypted with.")
 
     todo = [(i, o) for i, o in pairs if needs_work(mode, i, o)]
     if len(todo) < len(pairs):
