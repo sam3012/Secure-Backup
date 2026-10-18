@@ -53,7 +53,8 @@ jobs:
 
       - run: python test_secure_backup.py
 
-      - run: pyinstaller --noconfirm --windowed ${{ matrix.onefile }} ${{ matrix.icon }} --name SecureBackup app.py
+      # --add-data bundles the interface font (IBM Plex Sans) and its license.
+      - run: pyinstaller --noconfirm --windowed ${{ matrix.onefile }} ${{ matrix.icon }} --add-data assets/fonts:assets/fonts --name SecureBackup app.py
 
       - name: Smoke test the bundled app
         env:
